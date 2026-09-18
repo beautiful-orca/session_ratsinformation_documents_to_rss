@@ -1,9 +1,44 @@
-# session_ratsinformation_documents_to_rss
-Extracts the latest documents of the somacos session app / sessionnet to a feed in FreshRSS (HTML + XPath)
+# Sessionnet Duisburg Ratsinformation - RSS Feed Adapter
 
-Latest documents in session app by the City of Duisburg [https://sessionnet.owl-it.de/duisburg/bi/do0040.asp](https://sessionnet.owl-it.de/duisburg/bi/do0040.asp)
+A PHP script that fetches latest documents and their consultations from [Sessionnet Duisburg](https://sessionnet.owl-it.de/duisburg/bi/) and converts them into an **Atom feed** for easy integration with RSS readers or other applications.
 
-## Add Feed to FreshRSS with the type of feed source: HTML + XPath
+---
+
+## **Features**
+- Fetches documents and consultations from Sessionnet Duisburg.
+- Converts the data into a structured **Atom feed**.
+- Supports configurable `max-entries` via URL parameter (default: 20).
+- Handles text cleaning, URL normalization, and metadata extraction.
+
+---
+
+## **Usage**
+1. **Access the Script**:
+   - Directly call the script in your browser or RSS reader:
+     ```
+     /server.php
+     ```
+   - Optionally, limit the number of entries:
+     ```
+     /server.php?max-entries=10
+     ```
+
+2. **Output**:
+   - The script returns an **Atom feed** in XML format.
+
+---
+## **Requirements**
+- PHP 7.4+ (or a compatible version with `DOMDocument`, `cURL`, and `DateTime` support).
+- cURL extension enabled.
+- Access to the Sessionnet Duisburg website.
+
+---
+## **Configuration**
+- **Base URL**: `https://sessionnet.owl-it.de/duisburg/bi/`
+- **Feed Title**: `Ratsinformation Duisburg`
+- **Max Entries**: Adjustable via `?max-entries=N` (default: 20).
+
+## Old and basic FreshRSS extraction (HTML + XPath)
 
 Feed URL: `https://sessionnet.owl-it.de/duisburg/bi/do0040.asp`  
 feed title: `"Ratsinformation Duisburg"`  
