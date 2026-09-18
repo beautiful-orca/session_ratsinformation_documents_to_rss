@@ -12,7 +12,7 @@ A **PHP script** that fetches the latest documents and consultations from [Sessi
 - **Intelligent Processing**: Handles text cleaning, URL normalization, and metadata extraction.
 - **Robust Caching**:
   - File-based cache with automatic storage in `sys_get_temp_dir()/sessionnet_duisburg_cache`.
-  - Smart TTL: 15 minutes for the main list page, 24 hours for detail and "Beratungen" pages.
+  - Smart TTL: 55 minutes for the main list page, 24 hours for detail and "Beratungen" pages.
   - Graceful fallback to stale cache on fetch failures.
   - Manual cache bypass with `?no-cache=1`.
 

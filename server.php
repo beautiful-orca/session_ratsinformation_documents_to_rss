@@ -16,7 +16,7 @@ $maxEntries = isset($_GET['max-entries']) ? max(1, (int)$_GET['max-entries']) : 
 define('CACHE_DIR', sys_get_temp_dir() . '/sessionnet_duisburg_cache');
 // The main listing page changes more often than detail/Beratungen pages,
 // which rarely change once published, so they get different TTLs.
-define('CACHE_TTL_LIST', 15 * 60);        // 15 minutes for the main list page
+define('CACHE_TTL_LIST', 55 * 60);        // 55 minutes for the main list page
 define('CACHE_TTL_DETAIL', 24 * 60 * 60); // 24 hours for detail & Beratungen pages
 // ?no-cache=1 bypasses reading the cache for this request (still refreshes it)
 $noCache = isset($_GET['no-cache']) && $_GET['no-cache'] == '1';
