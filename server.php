@@ -3,6 +3,7 @@
 // Fetches documents and "Beratungen" (consultations) from Sessionnet Duisburg
 // Usage: Access this script directly (e.g., /session_ratsinformation_documents_to_rss.php)
 // Optional: ?max-entries=20 to limit the number of entries (default: 20)
+// Optional: ?no-cache=1 to bypass the cache for this request
 
 const FEED_URL = 'https://sessionnet.owl-it.de/duisburg/bi/do0040.asp';
 const FEED_TITLE = 'Ratsinformation Duisburg';
@@ -11,12 +12,87 @@ const BASE_URL = 'https://sessionnet.owl-it.de/duisburg/bi/';
 // Configurable via URL parameter: ?max-entries=20
 $maxEntries = isset($_GET['max-entries']) ? max(1, (int)$_GET['max-entries']) : 20;
 
+// --- Cache configuration ---
+// Cache directory (created if missing)
+define('CACHE_DIR', sys_get_temp_dir() . '/sessionnet_duisburg_cache');
+// How long cached pages stay valid, in seconds.
+// The main listing page changes more often than detail/Beratungen pages,
+// which rarely change once published, so they get different TTLs.
+define('CACHE_TTL_LIST', 15 * 60);        // 15 minutes for the main list page
+define('CACHE_TTL_DETAIL', 24 * 60 * 60); // 24 hours for detail & Beratungen pages
+// ?no-cache=1 bypasses reading the cache for this request (still refreshes it)
+$noCache = isset($_GET['no-cache']) && $_GET['no-cache'] == '1';
+
+/**
+ * Ensure the cache directory exists.
+ */
+function ensureCacheDir(): void {
+    if (!is_dir(CACHE_DIR)) {
+        @mkdir(CACHE_DIR, 0775, true);
+    }
+}
+
+/**
+ * Build a cache file path for a given URL.
+ */
+function cacheFilePath(string $url): string {
+    return CACHE_DIR . '/' . sha1($url) . '.cache';
+}
+
+/**
+ * Read a cached value if present and not expired.
+ * Returns null if there's no valid cache entry.
+ */
+function cacheGet(string $key, int $ttl): ?string {
+    $path = cacheFilePath($key);
+    if (!is_file($path)) {
+        return null;
+    }
+    if (time() - filemtime($path) > $ttl) {
+        return null;
+    }
+    $data = @file_get_contents($path);
+    return $data !== false ? $data : null;
+}
+
+/**
+ * Write a value to the cache (atomically, to be safe under concurrent requests).
+ */
+function cacheSet(string $key, string $value): void {
+    ensureCacheDir();
+    $path = cacheFilePath($key);
+    $tmpPath = $path . '.' . uniqid('', true) . '.tmp';
+    if (@file_put_contents($tmpPath, $value) !== false) {
+        @rename($tmpPath, $path);
+    } else {
+        @unlink($tmpPath);
+    }
+}
+
+/**
+ * Opportunistically remove expired cache files.
+ * Runs on a small fraction of requests to keep overhead low.
+ */
+function cacheCleanup(int $maxAge): void {
+    if (!is_dir(CACHE_DIR)) {
+        return;
+    }
+    if (mt_rand(1, 100) > 5) {
+        return; // only run cleanup ~5% of the time
+    }
+    foreach (glob(CACHE_DIR . '/*.cache') ?: [] as $file) {
+        if (time() - filemtime($file) > $maxAge) {
+            @unlink($file);
+        }
+    }
+}
+
 /**
  * Clean text for XML output
  */
 function cleanText(string $text): string {
     $text = str_replace(
-        ['Ã¤', 'Ã¶', 'Ã¼', 'Ã', 'Ã©', 'Ã¨', 'Ã', 'lÃ¤', 'lÃ¶', 'lÃ¼', 'LÃ¤', 'LÃ¶', 'LÃ¼', 'Ã¶', 'Ã¼', 'Ã¤'],
+        ['Ã¤', 'Ã¶', 'Ã¼', 'Ã', 'Ã©', 'Ã¨', 'Ã', 'lÃ¤', 'lÃ¶', 'lÃ¼', 'LÃ¤', 'LÃ¶', 'LÃ¼', 'Ã¶', 'Ã¼', 'Ã¤'],
         ['ä', 'ö', 'ü', 'Á', 'é', 'è', 'À', 'lä', 'lö', 'lü', 'Lä', 'Lö', 'Lü', 'ö', 'ü', 'ä'],
         $text
     );
@@ -36,9 +112,20 @@ function cleanHref(string $href): string {
 }
 
 /**
- * Fetch HTML content from URL
+ * Fetch HTML content from URL, transparently using a local cache.
+ *
+ * @param string $url        URL to fetch
+ * @param int    $ttl        Cache lifetime in seconds for this URL
+ * @param bool   $bypassCache If true, skip reading from cache (still writes fresh result)
  */
-function fetchHtml(string $url): string {
+function fetchHtml(string $url, int $ttl = CACHE_TTL_DETAIL, bool $bypassCache = false): string {
+    if (!$bypassCache) {
+        $cached = cacheGet($url, $ttl);
+        if ($cached !== null) {
+            return $cached;
+        }
+    }
+
     $ch = curl_init($url);
     curl_setopt_array($ch, [
         CURLOPT_RETURNTRANSFER => true,
@@ -59,29 +146,47 @@ function fetchHtml(string $url): string {
     curl_close($ch);
 
     if ($error) {
+        // Fall back to a stale cache entry (if any) rather than failing outright
+        $stale = cacheGet($url, PHP_INT_MAX);
+        if ($stale !== null) {
+            return $stale;
+        }
         throw new RuntimeException('cURL error: ' . $error);
     }
 
     if ($httpCode !== 200) {
+        $stale = cacheGet($url, PHP_INT_MAX);
+        if ($stale !== null) {
+            return $stale;
+        }
         throw new RuntimeException("HTTP error: $httpCode");
     }
 
     if (empty($html)) {
+        $stale = cacheGet($url, PHP_INT_MAX);
+        if ($stale !== null) {
+            return $stale;
+        }
         throw new RuntimeException('Empty response from URL: ' . $url);
     }
 
-    return mb_convert_encoding($html, 'UTF-8', mb_detect_encoding($html, 'UTF-8, ISO-8859-1', true));
+    $html = mb_convert_encoding($html, 'UTF-8', mb_detect_encoding($html, 'UTF-8, ISO-8859-1', true));
+
+    cacheSet($url, $html);
+    cacheCleanup(max(CACHE_TTL_LIST, CACHE_TTL_DETAIL) * 3);
+
+    return $html;
 }
 
 /**
  * Fetch and parse "Beratungen" (consultations) for a given __kvonr
  */
-function fetchBeratungen(string $kvonr): array {
+function fetchBeratungen(string $kvonr, bool $bypassCache = false): array {
     $beratungenUrl = BASE_URL . 'vo0053.asp?__kvonr=' . $kvonr;
     $beratungen = [];
 
     try {
-        $html = fetchHtml($beratungenUrl);
+        $html = fetchHtml($beratungenUrl, CACHE_TTL_DETAIL, $bypassCache);
         $dom = new DOMDocument();
         @$dom->loadHTML($html, LIBXML_HTML_NOIMPLIED | LIBXML_HTML_NODEFDTD);
         $xpath = new DOMXPath($dom);
@@ -143,7 +248,7 @@ function fetchBeratungen(string $kvonr): array {
 /**
  * Fetch and parse detail page for metadata
  */
-function fetchDetailPage(string $url): array {
+function fetchDetailPage(string $url, bool $bypassCache = false): array {
     $metadata = [
         'betreff' => '',
         'vorlage' => '',
@@ -153,7 +258,7 @@ function fetchDetailPage(string $url): array {
     ];
 
     try {
-        $html = fetchHtml($url);
+        $html = fetchHtml($url, CACHE_TTL_DETAIL, $bypassCache);
         $dom = new DOMDocument();
         @$dom->loadHTML($html, LIBXML_HTML_NOIMPLIED | LIBXML_HTML_NODEFDTD);
         $xpath = new DOMXPath($dom);
@@ -166,7 +271,7 @@ function fetchDetailPage(string $url): array {
 
         // Fetch "Beratungen" if __kvonr is available
         if (!empty($kvonr)) {
-            $metadata['beratungen'] = fetchBeratungen($kvonr);
+            $metadata['beratungen'] = fetchBeratungen($kvonr, $bypassCache);
         }
 
         // Extract Betreff
@@ -202,7 +307,7 @@ function fetchDetailPage(string $url): array {
 /**
  * Parse news items from HTML using XPath
  */
-function parseItems(string $html, int $maxEntries): array {
+function parseItems(string $html, int $maxEntries, bool $bypassCache = false): array {
     $dom = new DOMDocument();
     @$dom->loadHTML($html, LIBXML_HTML_NOIMPLIED | LIBXML_HTML_NODEFDTD);
     $xpath = new DOMXPath($dom);
@@ -264,7 +369,7 @@ function parseItems(string $html, int $maxEntries): array {
             $detailMetadata = [];
             if (!empty($link)) {
                 $detailUrl = cleanHref($link);
-                $detailMetadata = fetchDetailPage($detailUrl);
+                $detailMetadata = fetchDetailPage($detailUrl, $bypassCache);
             }
 
             // Build content with metadata, documents, and Beratungen
@@ -403,8 +508,8 @@ XML;
 
 // --- Main ---
 try {
-    $html = fetchHtml(FEED_URL);
-    $items = parseItems($html, $maxEntries);
+    $html = fetchHtml(FEED_URL, CACHE_TTL_LIST, $noCache);
+    $items = parseItems($html, $maxEntries, $noCache);
     $atom = toAtom($items);
 
     header('Content-Type: application/atom+xml; charset=utf-8');
