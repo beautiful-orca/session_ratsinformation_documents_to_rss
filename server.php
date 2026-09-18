@@ -36,10 +36,15 @@ define('CACHE_TTL_FEED', CACHE_TTL_LIST);
 // Cache helpers
 // ---------------------------------------------------------------------
 
-function ensureCacheDir(): void {
-    if (!is_dir(CACHE_DIR)) {
-        @mkdir(CACHE_DIR, 0775, true);
+function ensureCacheDir(): bool {
+    if (is_dir(CACHE_DIR)) {
+        return is_writable(CACHE_DIR);
     }
+    // Race-safe: another request may create it between the check and mkdir.
+    if (@mkdir(CACHE_DIR, 0775, true) || is_dir(CACHE_DIR)) {
+        return is_writable(CACHE_DIR);
+    }
+    return false;
 }
 
 function cacheFilePath(string $url): string {
@@ -47,46 +52,66 @@ function cacheFilePath(string $url): string {
 }
 
 /**
- * Read a cached value if present and not expired. Null if missing/expired.
+ * Read a cached value if present and not expired. Null if missing/expired/corrupt.
+ * Treats any failure to read as a cache miss rather than propagating an error —
+ * caching is a performance optimization, never a hard dependency.
  */
 function cacheGet(string $key, int $ttl): ?string {
-    $path = cacheFilePath($key);
-    if (!is_file($path)) {
+    if ($ttl <= 0) {
         return null;
     }
-    if (time() - filemtime($path) > $ttl) {
+    $path = cacheFilePath($key);
+    if (!is_file($path) || !is_readable($path)) {
+        return null;
+    }
+    $mtime = @filemtime($path);
+    if ($mtime === false || (time() - $mtime) > $ttl) {
         return null;
     }
     $data = @file_get_contents($path);
-    return $data !== false ? $data : null;
+    if ($data === false || $data === '') {
+        return null;
+    }
+    return $data;
 }
 
 /**
- * Write a value to the cache (atomically).
+ * Write a value to the cache (atomically). Returns whether the write succeeded;
+ * callers treat a failed write as non-fatal (the value simply isn't cached).
  */
-function cacheSet(string $key, string $value): void {
-    ensureCacheDir();
+function cacheSet(string $key, string $value): bool {
+    if (!ensureCacheDir()) {
+        return false;
+    }
     $path = cacheFilePath($key);
     $tmpPath = $path . '.' . uniqid('', true) . '.tmp';
-    if (@file_put_contents($tmpPath, $value) !== false) {
-        @rename($tmpPath, $path);
-    } else {
+    $written = @file_put_contents($tmpPath, $value);
+    if ($written === false || $written !== strlen($value)) {
         @unlink($tmpPath);
+        return false;
     }
+    if (!@rename($tmpPath, $path)) {
+        @unlink($tmpPath);
+        return false;
+    }
+    return true;
 }
 
 /**
  * Opportunistically remove expired cache files (runs on a small % of requests).
+ * Best-effort: any filesystem error for an individual file is skipped, not fatal.
  */
 function cacheCleanup(int $maxAge): void {
-    if (!is_dir(CACHE_DIR)) {
+    if (!is_dir(CACHE_DIR) || $maxAge <= 0) {
         return;
     }
     if (mt_rand(1, 100) > 5) {
         return;
     }
+    $now = time();
     foreach (glob(CACHE_DIR . '/*.cache') ?: [] as $file) {
-        if (time() - filemtime($file) > $maxAge) {
+        $mtime = @filemtime($file);
+        if ($mtime === false || ($now - $mtime) > $maxAge) {
             @unlink($file);
         }
     }
@@ -127,12 +152,17 @@ function cleanHref(string $href): string {
 
 /**
  * Build a cURL handle with shared, sane defaults.
+ * @throws RuntimeException if curl_init fails (e.g. curl extension misconfigured)
  */
 function newCurlHandle(string $url): CurlHandle {
     $ch = curl_init($url);
+    if ($ch === false) {
+        throw new RuntimeException('curl_init failed for URL: ' . $url);
+    }
     curl_setopt_array($ch, [
         CURLOPT_RETURNTRANSFER => true,
         CURLOPT_FOLLOWLOCATION => true,
+        CURLOPT_MAXREDIRS => 5,
         CURLOPT_HTTPHEADER => [
             'User-Agent: Mozilla/5.0 (compatible; FreshRSS-Adapter/1.0)',
             'Accept: text/html,application/xhtml+xml',
@@ -148,8 +178,16 @@ function newCurlHandle(string $url): CurlHandle {
     return $ch;
 }
 
+/**
+ * Normalize fetched HTML to UTF-8. Falls back to a safe default source
+ * encoding if detection is inconclusive, rather than passing false into
+ * mb_convert_encoding (which would throw a TypeError).
+ */
 function normalizeFetchedHtml(string $html): string {
-    return mb_convert_encoding($html, 'UTF-8', mb_detect_encoding($html, 'UTF-8, ISO-8859-1', true));
+    $detected = mb_detect_encoding($html, 'UTF-8, ISO-8859-1', true);
+    $sourceEncoding = $detected !== false ? $detected : 'ISO-8859-1';
+    $converted = @mb_convert_encoding($html, 'UTF-8', $sourceEncoding);
+    return $converted !== false ? $converted : $html;
 }
 
 /**
@@ -213,7 +251,18 @@ function fetchHtmlBatch(array $urls, int $ttl, bool $bypassCache = false): array
     }
 
     $mh = curl_multi_init();
-    curl_multi_setopt($mh, CURLMOPT_MAXCONNECTS, MAX_CONCURRENT_REQUESTS);
+    if ($mh === false) {
+        // Fall back to sequential fetching rather than failing the whole batch.
+        foreach ($toFetch as $url) {
+            try {
+                $results[$url] = fetchHtml($url, $ttl, $bypassCache);
+            } catch (RuntimeException $e) {
+                // Skip; caller treats a missing URL as "no data available".
+            }
+        }
+        return $results;
+    }
+    curl_multi_setopt($mh, CURLMOPT_MAXCONNECTS, max(1, MAX_CONCURRENT_REQUESTS));
 
     $handles = [];      // resource id => ['url' => string]
     $queue = $toFetch;  // remaining URLs to enqueue
@@ -223,7 +272,11 @@ function fetchHtmlBatch(array $urls, int $ttl, bool $bypassCache = false): array
     $enqueue = function () use (&$queue, &$handles, &$active, $mh) {
         while ($active < MAX_CONCURRENT_REQUESTS && !empty($queue)) {
             $url = array_shift($queue);
-            $ch = newCurlHandle($url);
+            try {
+                $ch = newCurlHandle($url);
+            } catch (RuntimeException $e) {
+                continue; // skip URLs whose handle couldn't be created
+            }
             curl_multi_add_handle($mh, $ch);
             $id = (int) $ch;
             $handles[$id] = ['url' => $url];
@@ -232,8 +285,18 @@ function fetchHtmlBatch(array $urls, int $ttl, bool $bypassCache = false): array
     };
     $enqueue();
 
+    // Safety valve: bound total iterations so a misbehaving curl_multi
+    // implementation (or a stuck handle) can't spin this loop forever.
+    $maxIterations = (count($toFetch) + MAX_CONCURRENT_REQUESTS) * 200;
+    $iterations = 0;
+
     $running = null;
     do {
+        $iterations++;
+        if ($iterations > $maxIterations) {
+            break;
+        }
+
         curl_multi_exec($mh, $running);
         if ($running > 0) {
             curl_multi_select($mh, 1.0);
@@ -251,7 +314,7 @@ function fetchHtmlBatch(array $urls, int $ttl, bool $bypassCache = false): array
 
                 if (!$error && $httpCode === 200 && !empty($content)) {
                     $html = normalizeFetchedHtml($content);
-                    cacheSet($url, $html);
+                    cacheSet($url, $html); // best-effort; failure just means no cache hit next time
                     $results[$url] = $html;
                 } else {
                     $stale = cacheGet($url, PHP_INT_MAX);
@@ -269,7 +332,7 @@ function fetchHtmlBatch(array $urls, int $ttl, bool $bypassCache = false): array
             // Keep the pool full while there's more work queued
             $enqueue();
         }
-    } while ($running > 0 || !empty($queue));
+    } while (($running > 0 || !empty($queue)) && $iterations <= $maxIterations);
 
     curl_multi_close($mh);
 
@@ -282,11 +345,18 @@ function fetchHtmlBatch(array $urls, int $ttl, bool $bypassCache = false): array
 
 /**
  * Parse a document into a DOMXPath. Centralized so loadHTML flags stay
- * consistent and errors are always suppressed the same way.
+ * consistent and errors are always suppressed the same way. Falls back to
+ * an empty document (rather than throwing) if the HTML is unparseable, so
+ * a single malformed page degrades to "no data found" instead of a fatal error.
  */
 function makeXPath(string $html): DOMXPath {
     $dom = new DOMDocument();
-    @$dom->loadHTML($html, LIBXML_HTML_NOIMPLIED | LIBXML_HTML_NODEFDTD);
+    if (trim($html) !== '') {
+        $priorSetting = libxml_use_internal_errors(true);
+        $dom->loadHTML($html, LIBXML_HTML_NOIMPLIED | LIBXML_HTML_NODEFDTD);
+        libxml_clear_errors();
+        libxml_use_internal_errors($priorSetting);
+    }
     return new DOMXPath($dom);
 }
 
@@ -514,7 +584,7 @@ function buildItemContent(array $meta, array $documents, array $beratungen): str
                 '  <li><a href="%s">%s</a> <span class="date">(%s)</span></li>',
                 htmlspecialchars($doc['url'], ENT_XML1),
                 $doc['name'],
-                $doc['date']
+                htmlspecialchars($doc['date'] ?? '', ENT_XML1, 'UTF-8')
             );
         }
         $docLines[] = '</ul></div>';
@@ -545,6 +615,16 @@ function buildItemContent(array $meta, array $documents, array $beratungen): str
 // Atom output
 // ---------------------------------------------------------------------
 
+/**
+ * Safely wrap content in a CDATA section, splitting any literal "]]>"
+ * sequence the content might contain (which would otherwise prematurely
+ * terminate the CDATA block and corrupt the XML).
+ */
+function wrapCdata(string $content): string {
+    $escaped = str_replace(']]>', ']]]]><![CDATA[>', $content);
+    return '<![CDATA[' . $escaped . ']]>';
+}
+
 function toAtom(array $items): string {
     $now = date('c');
     $feedUrlXml = htmlspecialchars(FEED_URL, ENT_XML1);
@@ -558,13 +638,28 @@ function toAtom(array $items): string {
             $dateObj = DateTime::createFromFormat('d.m.Y', $cleanDate)
                 ?: DateTime::createFromFormat('Y-m-d', $cleanDate)
                 ?: DateTime::createFromFormat('d/m/Y', $cleanDate);
-            if ($dateObj !== false) {
-                $date = $dateObj->format('c');
+            // createFromFormat can return an object for malformed-but-partially-
+            // matching input (e.g. "31.02.2026"); getLastErrors() catches that.
+            if ($dateObj instanceof DateTime) {
+                $errors = DateTime::getLastErrors();
+                $hasIssues = $errors !== false && ($errors['warning_count'] > 0 || $errors['error_count'] > 0);
+                if (!$hasIssues) {
+                    $date = $dateObj->format('c');
+                }
             }
         }
 
-        $linkXml = htmlspecialchars($item['link'], ENT_XML1);
-        $titleXml = $item['title'];
+        $link = $item['link'] ?? '';
+        $title = $item['title'] ?? '';
+        $content = $item['content'] ?? '';
+        if ($link === '' || $title === '') {
+            // Defensive: skip any item that lost its required fields somewhere
+            // upstream rather than emitting an invalid <entry>.
+            continue;
+        }
+
+        $linkXml = htmlspecialchars($link, ENT_XML1);
+        $titleXml = $title; // already passed through cleanText() upstream
 
         $entry = "  <entry>\n"
             . "    <id>{$linkXml}</id>\n"
@@ -577,7 +672,7 @@ function toAtom(array $items): string {
             $entry .= "    <category term=\"{$tagXml}\"/>\n";
         }
 
-        $entry .= "    <content type=\"html\"><![CDATA[" . $item['content'] . "]]></content>\n"
+        $entry .= "    <content type=\"html\">" . wrapCdata($content) . "</content>\n"
             . "  </entry>\n";
 
         $entries .= $entry;
@@ -593,6 +688,31 @@ function toAtom(array $items): string {
   <generator uri="https://github.com/FreshRSS/FreshRSS" version="1.0">FreshRSS Adapter</generator>
   {$entries}</feed>
 XML;
+}
+
+/**
+ * Sanity-check the XML we just built before caching/serving it, so a
+ * parsing bug surfaces as a clear 500 instead of a broken feed download.
+ */
+function assertValidFeedXml(string $xml): void {
+    if (trim($xml) === '') {
+        throw new RuntimeException('Assembled feed is empty.');
+    }
+    $priorSetting = libxml_use_internal_errors(true);
+    libxml_clear_errors();
+    $dom = new DOMDocument();
+    $ok = $dom->loadXML($xml, LIBXML_NONET);
+    $errors = libxml_get_errors();
+    libxml_clear_errors();
+    libxml_use_internal_errors($priorSetting);
+
+    if (!$ok) {
+        $firstError = $errors[0]->message ?? 'unknown XML error';
+        throw new RuntimeException('Assembled feed is not well-formed XML: ' . trim($firstError));
+    }
+    if ($dom->documentElement === null || $dom->documentElement->localName !== 'feed') {
+        throw new RuntimeException('Assembled feed is missing its root <feed> element.');
+    }
 }
 
 // ---------------------------------------------------------------------
