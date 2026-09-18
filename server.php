@@ -1,5 +1,5 @@
 <?php
-// Sessionnet Duisburg Ratsinformation → Atom Feed Adapter
+// Sessionnet Duisburg Ratsinformation - RSS Feed Adapter
 // Fetches documents and "Beratungen" (consultations) from Sessionnet Duisburg
 // Usage: Access this script directly (e.g., /session_ratsinformation_documents_to_rss.php)
 // Optional: ?max-entries=20 to limit the number of entries (default: 20)
