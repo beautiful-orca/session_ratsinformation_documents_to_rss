@@ -1,7 +1,7 @@
 <?php
 // Sessionnet Duisburg Ratsinformation - RSS Feed Adapter
 // Fetches documents and "Beratungen" (consultations) from Sessionnet Duisburg
-// Usage: Access this script directly (e.g., /session_ratsinformation_documents_to_rss.php)
+// Usage: Access this script directly (e.g., /server.php)
 // Optional: ?max-entries=20 to limit the number of entries (default: 20)
 // Optional: ?no-cache=1 to bypass the cache for this request
 
