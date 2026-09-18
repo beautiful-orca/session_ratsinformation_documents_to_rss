@@ -58,6 +58,7 @@ http://freshrss-sessionnet:3457/server.php
 - **Feed Title**: `Ratsinformation Duisburg`
 - **Max Entries**: Adjustable via `?max-entries=N` (default: 20).
 
+---
 ## Old and basic FreshRSS extraction (HTML + XPath)
 
 Feed URL: `https://sessionnet.owl-it.de/duisburg/bi/do0040.asp`  
