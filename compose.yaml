@@ -1,0 +1,51 @@
+services:
+  freshrss:
+    image: freshrss/freshrss:latest
+    container_name: freshrss
+    restart: unless-stopped
+    volumes:
+      - data:/var/www/FreshRSS/data
+      - ./extensions:/var/www/FreshRSS/extensions
+    env_file: ./.env
+    environment:
+      TZ: Europe/Berlin
+      CRON_MIN: '*/15'
+      TRUSTED_PROXY: 127.0.0.1/32 192.168.188.6/32
+      FRESHRSS_INSTALL: |-
+        --api-enabled
+        --base-url ${BASE_URL}
+        --default-user admin
+      FRESHRSS_USER: |-
+        --api-password ${ADMIN_API_PASSWORD}
+        --email ${ADMIN_EMAIL}
+        --password ${ADMIN_PASSWORD}
+        --user admin
+    ports:
+      - "127.0.0.1:8081:80"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "cli/health.php"]
+      timeout: 10s
+      start_period: 60s
+      start_interval: 11s
+      interval: 75s
+      retries: 3
+
+  freshrss-sessionnet:
+    container_name: freshrss-sessionnet
+    image: php:cli-alpine
+    restart: unless-stopped
+    volumes:
+      - ./server.php:/app/server.php
+    working_dir: /app
+    command: php -S 0.0.0.0:3457 server.php
+    #ports:
+      #- "127.0.0.1:3457:3457"
+
+volumes:
+  data:
+    driver: local

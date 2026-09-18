@@ -33,6 +33,26 @@ A PHP script that fetches latest documents and their consultations from [Session
 - Access to the Sessionnet Duisburg website.
 
 ---
+### **Docker Setup (Recommended)**
+Use the provided `compose.yaml` to run the script alongside **FreshRSS** in Docker.
+
+1. **Prerequisites**:
+- Docker and Docker Compose installed.
+- A `.env` file with the required environment variables (e.g., `BASE_URL`, `ADMIN_API_PASSWORD`, `ADMIN_EMAIL`, `ADMIN_PASSWORD`).
+
+2. **Start the Services**:
+```bash
+docker compose up -d
+```
+
+FreshRSS will be available at `http://127.0.0.1:8081`.  
+The adapter runs internally on port `3457` (not exposed externally).  
+Add the Feed to FreshRSS:In FreshRSS, add a new feed with the URL:
+```
+http://freshrss-sessionnet:3457/server.php
+```
+
+---
 ## **Configuration**
 - **Base URL**: `https://sessionnet.owl-it.de/duisburg/bi/`
 - **Feed Title**: `Ratsinformation Duisburg`
